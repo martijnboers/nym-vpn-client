@@ -38,6 +38,8 @@ pub struct Socks5EnableConfig {
     pub network_details: Option<NymNetworkDetails>,
     /// VPN exit gateway identity to exclude during random Network Requester selection (for privacy)
     pub vpn_exit_gateway_identity: Option<String>,
+    /// Enable two-hop (Fast Mode) for mixnet connections
+    pub enable_two_hop: bool,
 }
 
 /// SOCKS5 service errors
@@ -137,6 +139,7 @@ impl Socks5ServiceState {
             idle_timeout,
             network_details,
             vpn_exit_gateway_identity,
+            enable_two_hop,
         } = config;
 
         // Prevent concurrent enable calls
@@ -206,6 +209,7 @@ impl Socks5ServiceState {
             gateway_cache_handle,
             network_details,
             vpn_exit_gateway_identity,
+            enable_two_hop,
         };
         let lazy_socks5 = Arc::new(LazySocks5::new(
             config,

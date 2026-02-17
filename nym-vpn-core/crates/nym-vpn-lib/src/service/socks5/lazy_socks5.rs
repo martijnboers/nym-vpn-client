@@ -46,6 +46,8 @@ pub struct LazySocks5Config {
     pub network_details: Option<NymNetworkDetails>,
     /// VPN exit gateway identity to exclude during random Network Requester selection (for privacy)
     pub vpn_exit_gateway_identity: Option<String>,
+    /// Enable two-hop (Fast Mode) for mixnet connections
+    pub enable_two_hop: bool,
 }
 
 /// Errors from the LazySocks5
@@ -176,7 +178,7 @@ impl LazySocks5 {
                                 TunnelState::Connected { connection_data } => {
                                     match &connection_data.tunnel {
                                         TunnelConnectionData::Mixnet(_) => true, // 1
-                                        TunnelConnectionData::Wireguard(_) => false, // 2
+                                        TunnelConnectionData::Wireguard(_) => true, // 2
                                     }
                                 }
                                 TunnelState::Disconnected | TunnelState::Error(_) => {
@@ -547,6 +549,14 @@ impl LazySocks5 {
         // Configure gateway if specified
         if let Some(gateway_id) = gateway_id {
             builder = builder.request_gateway(gateway_id.clone());
+        }
+
+        // Enable 2-hop (Fast Mode) if configured
+        if self.config.enable_two_hop {
+             // disable_mix_hops(true) configures the client to use 2 hops (Entry -> Exit)
+             // instead of the default 5 hops (Entry -> Mix -> Mix -> Mix -> Exit)
+            builder = builder.disable_mix_hops(true);
+            debug!("Using 2-hop (Fast Mode) mixnet client");
         }
 
         let mixnet_client = builder

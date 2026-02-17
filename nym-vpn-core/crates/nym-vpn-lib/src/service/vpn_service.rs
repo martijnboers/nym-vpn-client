@@ -1291,224 +1291,30 @@ impl NymVpnService {
                         .last_probe
                         .as_ref()
                         .and_then(|probe| probe.outcome.as_exit.as_ref())
-                        .map(|exit_point| exit_point.can_connect)
-                        .unwrap_or(false)
+                        .and_then(|exit| exit.socks5.as_ref())
+                        .is_some()
                 })
                 .collect(),
         );
 
-        // Get exit node's identity depending on the exit point
-        let exit_point = &enable_socks5_request.exit_point;
-        let gateway_identity: NodeIdentity = match exit_point {
-            ExitPoint::Address { address } => NodeIdentity::from(*address.gateway().inner()),
-            ExitPoint::Gateway { identity } => NodeIdentity::from(*identity.inner()),
-            ExitPoint::Random => {
-                // Random exit point: Always do random selection, ignoring VPN's exit gateway.
-                // This preserves anonymity through rotation - using VPN's exit gateway would
-                // always route through the same gateway, reducing anonymity benefits.
-                // Note: Entry gateway still uses VPN's entry gateway (for firewall compatibility),
-                // but exit gateway (Network Requester) rotates for anonymity.
-                tracing::debug!("Selecting random SOCKS5 exit gateway (for rotation/anonymity)");
-
-                let exit_point: nym_gateway_directory::ExitPoint = exit_point.clone().into();
-
-                let exit_filters = if self.config_manager.config().residential_exit {
-                    GatewayFilters::from(&[GatewayFilter::Residential, GatewayFilter::Exit])
-                } else {
-                    GatewayFilters::default()
-                };
-
-                let selected_gateway = exit_gateways
-                    .find_best_socks5_gateway(&exit_point, &exit_filters)
-                    .map_err(|e| {
-                        Socks5Error::InvalidConfig(format!(
-                            "Failed to select random SOCKS5 exit gateway: {e}"
-                        ))
-                    })?;
-
-                tracing::info!(
-                    "Selected random SOCKS5 exit gateway: {}, location: {}",
-                    selected_gateway.identity(),
-                    selected_gateway
-                        .two_letter_iso_country_code()
-                        .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
-                );
-
-                selected_gateway.identity()
-            }
-            ExitPoint::Country { .. } | ExitPoint::Region { .. } => {
-                // For location-based exit points, check if VPN is connected first
-                // If connected, use VPN's actual gateway to avoid firewall routing issues
-                // (but only if it supports SOCKS5 - otherwise fall back to location-based selection)
-                let tunnel_state = self.tunnel_state.read().await.clone();
-
-                let selected_identity = if let TunnelState::Connected { connection_data } =
-                    tunnel_state
-                {
-                    // VPN is connected - try to use its actual exit gateway
-                    let vpn_gateway_id = &connection_data.exit_gateway.id;
-                    tracing::info!(
-                        "VPN is connected to exit gateway {}, checking if it supports SOCKS5",
-                        vpn_gateway_id
-                    );
-
-                    // Validate that VPN's gateway supports SOCKS5 and has nr_address
-                    match NodeIdentity::from_base58_string(vpn_gateway_id) {
-                        Ok(vpn_gateway_identity) => {
-                            // Look up the gateway directly (VPN uses Wg type, but gateway might also support MixnetExit)
-                            let gateway_full = self
-                                .gateway_cache_handle
-                                .lookup_nymnode_by_identity(vpn_gateway_identity)
-                                .await
-                                .ok();
-
-                            if let Some(gateway_full) = gateway_full {
-                                // Check if gateway supports SOCKS5
-                                // Prefer VPN API's socks5 data when available (more accurate),
-                                // otherwise fall back to checking nr_address and can_connect
-                                let supports_socks5 = gateway_full
-                                    .last_probe
-                                    .as_ref()
-                                    .and_then(|probe| probe.outcome.as_exit.as_ref())
-                                    .and_then(|exit| exit.socks5.as_ref())
-                                    .map(|socks5| {
-                                        // Use VPN API's SOCKS5 data - check if it has a valid score
-                                        // (score being Some indicates it was probed and works)
-                                        socks5.score.is_some()
-                                    })
-                                    .unwrap_or_else(|| {
-                                        // Fallback: check nr_address and can_connect (for gateways without VPN API data yet)
-                                        gateway_full.nr_address.is_some()
-                                            && gateway_full
-                                                .last_probe
-                                                .as_ref()
-                                                .and_then(|probe| probe.outcome.as_exit.as_ref())
-                                                .map(|exit_point| exit_point.can_connect)
-                                                .unwrap_or(false)
-                                    });
-
-                                if supports_socks5 {
-                                    // Gateway supports SOCKS5 - use it directly even if not in filtered MixnetExit list
-                                    // (VPN uses Wg gateways, but they may also support MixnetExit/SOCKS5)
-                                    tracing::info!(
-                                        "Using VPN's exit gateway {} for SOCKS5 (same gateway, firewall rules should allow connection)",
-                                        vpn_gateway_id
-                                    );
-                                    // Use VPN's gateway identity - skip selection
-                                    Some(vpn_gateway_identity)
-                                } else {
-                                    tracing::debug!(
-                                        "VPN's exit gateway {} does not support SOCKS5 (no nr_address or cannot connect as exit), selecting different gateway",
-                                        vpn_gateway_id
-                                    );
-                                    None
-                                }
-                            } else {
-                                tracing::debug!(
-                                    "VPN's exit gateway {} not found in cache, selecting different gateway",
-                                    vpn_gateway_id
-                                );
-                                None
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse VPN's exit gateway identity {}: {}. Selecting new gateway.",
-                                vpn_gateway_id,
-                                e
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // Use VPN's gateway if available, otherwise do selection
-                if let Some(gateway_identity) = selected_identity {
-                    gateway_identity
-                } else {
-                    // VPN not connected or gateway doesn't support SOCKS5 - do selection
-                    tracing::debug!("Selecting SOCKS5 exit node for exit point: {exit_point:?}",);
-
-                    // Convert to gateway_directory types for lookup
-                    let exit_point: nym_gateway_directory::ExitPoint = exit_point.clone().into();
-
-                    let exit_filters = if self.config_manager.config().residential_exit {
-                        GatewayFilters::from(&[GatewayFilter::Residential, GatewayFilter::Exit])
-                    } else {
-                        GatewayFilters::default()
-                    };
-
-                    let selected_gateway = exit_gateways
-                        .find_best_socks5_gateway(&exit_point, &exit_filters)
-                        .map_err(|e| {
-                            Socks5Error::InvalidConfig(format!(
-                                "Failed to select SOCKS5 exit gateway: {e}"
-                            ))
-                        })?;
-
-                    tracing::info!(
-                        "Selected SOCKS5 exit gateway: {}, location: {}",
-                        selected_gateway.identity(),
-                        selected_gateway
-                            .two_letter_iso_country_code()
-                            .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
-                    );
-
-                    selected_gateway.identity()
-                }
-            }
-        };
-
-        // Verify the selected gateway supports SOCKS5 (has Network Requester address)
-        // Note: We don't use this NR address directly - we use random selection for privacy
-        let gateway = self
-            .gateway_cache_handle
-            .lookup_nymnode_by_identity(gateway_identity)
-            .await
-            .map_err(|e| {
-                Socks5Error::InvalidConfig(format!(
-                    "Failed to lookup gateway {}: {}",
-                    gateway_identity, e
-                ))
-            })?;
-
-        // Verify gateway has Network Requester support (required for SOCKS5)
-        if gateway.nr_address.is_none() {
+        if exit_gateways.is_empty() {
             return Err(Socks5Error::GatewayNotSupported);
         }
 
-        let request_timeout = socks5_request_timeout();
-        let idle_timeout = socks5_idle_timeout();
+        // Get network details
+        let network_details = self.network_tx.borrow().nym_network_details().clone();
 
-        // Enable Network Requester rotation for privacy - rotates every 15 minutes
-        // Rotation only occurs when WireGuard VPN is connected and there are no active SOCKS5 connections
-        // For privacy, start with random Network Requester (None) instead of using exit gateway's NR
-        // This avoids correlation between VPN traffic and SOCKS5 traffic
-        let network_requester_rotation_interval = Some(Duration::from_secs(15 * 60)); // 15 minutes
-        let gateway_cache_handle = Some(self.gateway_cache_handle.clone());
-
-        // Get current VPN exit gateway identity to exclude during random selection for privacy
-        let vpn_exit_gateway_identity = {
-            let tunnel_state = self.tunnel_state.read().await;
-            if let TunnelState::Connected {
-                ref connection_data,
-            } = *tunnel_state
-            {
+        // Get VPN exit gateway identity (if any) to exclude from random selection
+        let vpn_exit_gateway_identity =
+            if let TunnelState::Connected { connection_data } = &*self.tunnel_state.read().await {
                 Some(connection_data.exit_gateway.id.clone())
             } else {
                 None
-            }
-        };
+            };
 
-        // Get network details from current network environment to ensure SOCKS5 uses correct network
-        // Clone immediately to avoid holding watch::Ref across await (not Send)
-        let network_details = Some(self.network_tx.borrow().nym_network_details().clone());
-
-        tracing::info!(
-            "Starting SOCKS5 with random Network Requester selection (excluding VPN exit gateway for privacy)"
-        );
+        // Enable the SOCKS5 service
+        // Pass the enable_two_hop preference from global config
+        let enable_two_hop = self.config_manager.config().enable_two_hop;
 
         self.socks5_service
             .enable(Socks5EnableConfig {
@@ -1517,21 +1323,37 @@ impl NymVpnService {
                 http_rpc_proxy_listen_address: enable_socks5_request
                     .http_rpc_settings
                     .listen_address,
-                network_requester_address: None, // Start with random selection for privacy
-                network_requester_rotation_interval,
-                gateway_cache_handle,
-                request_timeout,
-                idle_timeout,
-                network_details,
-                vpn_exit_gateway_identity, // Exclude VPN exit gateway during random selection
+                // If exit point is not set or random, pass None to let LazySocks5 select random
+                network_requester_address: match enable_socks5_request.exit_point {
+                    ExitPoint::Gateway { identity } => {
+                        // Find the gateway in our filtered list to get its NR address
+                        // Note: SOCKS5 uses the NR address, not the gateway identity key!
+                        let target_identity = identity.inner();
+                        exit_gateways
+                            .into_iter()
+                            .find(|g| g.identity() == *target_identity)
+                            .and_then(|g| g.nr_address)
+                    }
+                    ExitPoint::Random => None, // Random selection handled by LazySocks5
+                    ExitPoint::Address { .. } | ExitPoint::Country { .. } | ExitPoint::Region { .. } => {
+                        // For now, these selections fall back to random
+                        // TODO: Implement proper filtering for SOCKS5
+                        tracing::warn!(
+                            "Address/Country/Region selection not yet implemented for SOCKS5, falling back to random"
+                        );
+                        None
+                    }
+                },
+                network_requester_rotation_interval: Some(Duration::from_secs(60 * 60)), // Rotate every hour
+                gateway_cache_handle: Some(self.gateway_cache_handle.clone()),
+                request_timeout: socks5_request_timeout(),
+                idle_timeout: socks5_idle_timeout(),
+                network_details: Some(network_details),
+                vpn_exit_gateway_identity,
+                enable_two_hop,
             })
             .await?;
 
-        tracing::info!("Lazy SOCKS5 proxy service enabled successfully");
-        tracing::info!(
-            "Mixnet will initialize on first SOCKS5 connection and shut down after {}s of inactivity",
-            idle_timeout.as_secs()
-        );
         Ok(())
     }
 
